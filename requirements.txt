@@ -8,3 +8,4 @@ pydantic
 requests
 python-dotenv
 numpy
+cachetools

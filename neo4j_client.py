@@ -154,3 +154,27 @@ def get_user_by_email_or_id(identifier: str):
                 "password": record["password"]
             }
         return None
+
+def get_repo_metadata(repo_id: str):
+    """
+    Given a repo_id stored in Neo4j, fetch the Repo node,
+    extract (owner, repo), and return full metadata from GitHub API.
+    """
+
+    with driver.session() as session:
+        result = session.run(
+            """
+            MATCH (r:Repo {id: $repo_id})
+            RETURN r.owner AS owner, r.repo AS repo_name, r.branch AS branch
+            """,
+            repo_id=repo_id
+        ).single()
+
+    if result is None:
+        raise ValueError(f"No repo found with id {repo_id}")
+
+    return {
+        "owner": result["owner"],
+        "repo_name": result["repo_name"],
+        "branch": result["branch"]
+    }

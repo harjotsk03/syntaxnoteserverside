@@ -1,15 +1,16 @@
-# app.py
 import os
 from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 from typing import Optional
+from cachetools import TTLCache
 from models import IngestRequest, QueryRequest, RegisterRequest, LoginRequest, TokenResponse
 from ingest import ingest_repo
 from query_engine import answer_question
 from auth import hash_password, verify_password, create_access_token, decode_access_token
-from neo4j_client import create_user, get_user_by_email, list_users, get_user_repos, get_user_by_email_or_id
+from neo4j_client import create_user, get_user_by_email, list_users, get_user_repos, get_user_by_email_or_id, get_repo_metadata
+from github_fetcher import fetch_repo_metadata, get_repo_stats
 
 app = FastAPI()
 security = HTTPBearer()
@@ -21,13 +22,15 @@ origins = [
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,  # allow your frontend
+    allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["*"],  # allow POST, GET, OPTIONS, etc.
-    allow_headers=["*"],  # allow headers like Authorization
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# Response model ensures repo_id is a string
+# In-memory cache: 5 min TTL, max 100 items
+repo_cache = TTLCache(maxsize=100, ttl=300)
+
 class IngestResponse(BaseModel):
     repo_id: str = Field(..., description="The inserted repo ID")
 
@@ -38,11 +41,7 @@ class RepoInfo(BaseModel):
     branch: str
     created_at: Optional[str] = None
 
-# Dependency to extract user_id from JWT
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
-    """
-    Extract and validate JWT token, return user_id
-    """
     token = credentials.credentials
     try:
         payload = decode_access_token(token)
@@ -74,7 +73,6 @@ def register(req: RegisterRequest):
     existing = get_user_by_email(req.email)
     if existing:
         raise HTTPException(400, "Email already registered")
-
     hashed_pw = hash_password(req.password)
     user_id = create_user(req.email, hashed_pw)
     token = create_access_token({"sub": user_id})
@@ -98,20 +96,12 @@ def debug_list_files(owner: str, repo: str, branch: str = "main"):
     from github_fetcher import list_files
     try:
         files = list_files(owner, repo, branch)
-        return {
-            "total_files": len(files),
-            "files": files
-        }
+        return {"total_files": len(files), "files": files}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-# NEW ROUTE: Get current user's repositories
 @app.get("/my-repos")
 def get_my_repos(current_user_id: str = Depends(get_current_user)):
-    """
-    Get all repositories owned by the authenticated user
-    Requires: Bearer token in Authorization header
-    """
     try:
         repos = get_user_repos(current_user_id)
         return {
@@ -122,18 +112,46 @@ def get_my_repos(current_user_id: str = Depends(get_current_user)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# BONUS: Get current user info
 @app.get("/me")
 def get_current_user_info(current_user_id: str = Depends(get_current_user)):
-    """
-    Get current authenticated user's information
-    Requires: Bearer token in Authorization header
-    """
     user = get_user_by_email_or_id(current_user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    
     return {
         "user_id": user["user_id"],
         "email": user["email"]
     }
+
+@app.get("/repo-metadata/{repo_id}")
+def api_repo_metadata(
+    repo_id: str,
+    current_user: str = Depends(get_current_user)
+):
+    # Check cache
+    if repo_id in repo_cache:
+        print(f"Cache HIT for {repo_id}")
+        return repo_cache[repo_id]
+    
+    print(f"Cache MISS for {repo_id}")
+    
+    # Fetch from database
+    repoNode = get_repo_metadata(repo_id)
+    if not repoNode:
+        raise HTTPException(404, "Repo not found")
+
+    owner = repoNode["owner"]
+    repo = repoNode["repo_name"]
+
+    repoStats = get_repo_stats(owner, repo)
+    repoMetadata = fetch_repo_metadata(owner, repo)
+
+    result = {
+        "repoNode": repoNode,
+        "repoStats": repoStats,
+        "repoMetadata": repoMetadata
+    }
+    
+    # Store in cache
+    repo_cache[repo_id] = result
+    
+    return result
