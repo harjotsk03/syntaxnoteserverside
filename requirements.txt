@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+supabase
+tiktoken
+openai
+neo4j
+pydantic
+requests
+python-dotenv
+numpy
